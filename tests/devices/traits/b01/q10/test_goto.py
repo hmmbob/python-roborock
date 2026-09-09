@@ -43,6 +43,22 @@ def test_goto_action_ignores_previous_trace_session() -> None:
     assert commands == []
 
 
+def test_goto_action_does_not_pause_unconfirmed_task() -> None:
+    """A new trace alone does not establish ownership of a zone-clean task."""
+    action = GotoAction(TARGET, previous_trace_sequence=1, tolerance=200)
+    commands: list[GotoActionCommand] = []
+    action.add_update_listener(commands.append)
+
+    action.update(
+        _snapshot(
+            position=TARGET,
+            clean_task_type=YXDeviceCleanTask.SMART,
+        )
+    )
+
+    assert commands == []
+
+
 def test_goto_action_completes_when_owned_session_is_replaced() -> None:
     """A later trace sequence is never controlled by the older goto."""
     action = GotoAction(TARGET, previous_trace_sequence=1, tolerance=200)

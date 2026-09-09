@@ -70,7 +70,7 @@ def test_encode_clean_params_source_verified_fixture() -> None:
     )
 
 
-@pytest.mark.parametrize("clean_count", [0, 4])
+@pytest.mark.parametrize("clean_count", [0, 4, True])
 def test_encode_clean_params_rejects_invalid_clean_count(clean_count: int) -> None:
     """The protocol validates the device's supported clean-count range."""
     with pytest.raises(ValueError, match="clean_count must be between 1 and 3"):

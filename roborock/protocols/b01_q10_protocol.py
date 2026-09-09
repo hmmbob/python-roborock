@@ -57,7 +57,7 @@ def encode_clean_params(params: CleanParams) -> str:
         raise ValueError("params must be CleanParams")
     if not isinstance(params.first_corner, Q10RoborockPoint) or not isinstance(params.second_corner, Q10RoborockPoint):
         raise ValueError("zone corners must be Q10RoborockPoint values")
-    if not 1 <= params.clean_count <= 3:
+    if isinstance(params.clean_count, bool) or not 1 <= params.clean_count <= 3:
         raise ValueError("clean_count must be between 1 and 3")
     if params.first_corner.x == params.second_corner.x or params.first_corner.y == params.second_corner.y:
         raise ValueError("zone corners must enclose an area")

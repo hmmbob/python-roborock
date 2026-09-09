@@ -139,7 +139,7 @@ class GotoAction:
             return
 
         if (
-            self._owned_trace_sequence is not None
+            self.owns(snapshot)
             and snapshot.position is not None
             and hypot(
                 snapshot.position.x - self._target.x,
