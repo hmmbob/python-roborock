@@ -2,64 +2,30 @@
 
 import asyncio
 import logging
-from base64 import b64encode
+from collections.abc import Callable
 from math import hypot
-from struct import error as StructError
-from struct import pack
 
 from roborock.data.b01_q10.b01_q10_code_mappings import (
     B01_Q10_DP,
     YXCleanType,
     YXDeviceCleanTask,
-    YXDeviceState,
     YXFanLevel,
 )
+from roborock.data.b01_q10.b01_q10_containers import Q10RoborockPoint
 from roborock.exceptions import RoborockException
+from roborock.protocols.b01_q10_protocol import CleanParams, encode_clean_params
 
 from .command import CommandTrait
-from .coordinates import roborock_to_vector_coordinate
+from .goto import GotoAction, GotoActionCommand, GotoSnapshot
 from .map import MapContentTrait
 from .status import StatusTrait
 
-_ZONE_NAME_FIELD_LENGTH = 19
 _GOTO_HALF_ZONE_SIZE = 200
 _GOTO_TOLERANCE = 200
 _GOTO_TIMEOUT = 300
 _GOTO_RETRY_INTERVAL = 1
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _encode_zone(x1: int, y1: int, x2: int, y2: int, clean_count: int) -> str:
-    """Encode one rectangular Q10 cleaning zone."""
-    if not 1 <= clean_count <= 3:
-        raise ValueError("clean_count must be between 1 and 3")
-
-    min_x, max_x = sorted((x1, x2))
-    min_y, max_y = sorted((y1, y2))
-    points = (
-        (min_x, min_y),
-        (max_x, min_y),
-        (max_x, max_y),
-        (min_x, max_y),
-    )
-    payload = bytearray((1, clean_count, 1, len(points)))
-    try:
-        for point_x, point_y in points:
-            payload.extend(
-                pack(
-                    ">hh",
-                    roborock_to_vector_coordinate(point_x),
-                    roborock_to_vector_coordinate(point_y),
-                )
-            )
-    except StructError as err:
-        raise ValueError("zone coordinates are outside the supported range") from err
-
-    # The app protocol reserves a fixed 19-byte UTF-8 name field per zone.
-    payload.append(0)
-    payload.extend(bytes(_ZONE_NAME_FIELD_LENGTH))
-    return b64encode(payload).decode()
 
 
 class VacuumTrait:
@@ -79,118 +45,90 @@ class VacuumTrait:
         self._command = command
         self._status = status
         self._map = map_content
-        self._goto_monitor_task: asyncio.Task[None] | None = None
-        self._goto_trace_sequence: int | None = None
+        self._goto_action: GotoAction | None = None
+        self._goto_action_remove_listener: Callable[[], None] | None = None
+        self._goto_timeout_task: asyncio.Task[None] | None = None
+        self._goto_command_task: asyncio.Task[None] | None = None
+        self._remove_map_listener = self._map.add_update_listener(self._goto_source_updated)
+        self._remove_status_listener = self._status.add_update_listener(self._goto_source_updated)
 
     async def close(self) -> None:
         """Cancel background work owned by the trait."""
-        if (task := self._goto_monitor_task) is None:
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        self._goto_monitor_task = None
-        self._goto_trace_sequence = None
+        self.cancel_goto()
+        self._remove_map_listener()
+        self._remove_status_listener()
 
     def cancel_goto(self) -> None:
-        """Cancel monitoring for an emulated goto replaced by another command."""
-        if self._goto_monitor_task is not None:
-            self._goto_monitor_task.cancel()
-            self._goto_monitor_task = None
-            self._goto_trace_sequence = None
-
-    async def _async_monitor_goto_target(
-        self,
-        x: int,
-        y: int,
-        previous_trace_sequence: int | None,
-    ) -> None:
-        """Pause the owned mini-zone task after it reaches the target."""
+        """Cancel an emulated goto replaced by another command."""
+        if self._goto_action is not None:
+            self._goto_action.complete()
+            self._goto_action = None
+        if self._goto_action_remove_listener is not None:
+            self._goto_action_remove_listener()
+            self._goto_action_remove_listener = None
         current_task = asyncio.current_task()
-        owned_trace_sequence: int | None = None
-        owned_task_seen = False
-        update_event = asyncio.Event()
-        remove_map_listener = self._map.add_update_listener(update_event.set)
-        remove_status_listener = self._status.add_update_listener(update_event.set)
+        for task_name in ("_goto_timeout_task", "_goto_command_task"):
+            if (task := getattr(self, task_name)) is not None:
+                if task is not current_task:
+                    task.cancel()
+                setattr(self, task_name, None)
+
+    def _goto_snapshot(self) -> GotoSnapshot:
+        """Return the latest state used by an active goto action."""
+        return GotoSnapshot(
+            position=self._map.robot_position,
+            trace_sequence=self._map.trace_sequence,
+            clean_task_type=self._status.clean_task_type,
+            status=self._status.status,
+        )
+
+    def _goto_source_updated(self) -> None:
+        """Feed push-derived map or status state to the active goto action."""
+        if self._goto_action is not None:
+            self._goto_action.update(self._goto_snapshot())
+
+    def _goto_action_updated(self, action: GotoAction, command: GotoActionCommand) -> None:
+        """Schedule a device command requested by the active goto action."""
+        if action is not self._goto_action:
+            return
+        if command is GotoActionCommand.COMPLETE:
+            self.cancel_goto()
+            return
+        if self._goto_command_task is None:
+            self._goto_command_task = asyncio.create_task(
+                self._async_handle_goto_command(action, command),
+                name="roborock_q10_goto_command",
+            )
+
+    async def _async_handle_goto_command(self, action: GotoAction, command: GotoActionCommand) -> None:
+        """Perform a pause or stop requested by the active goto action."""
+        current_task = asyncio.current_task()
+        dp_command = B01_Q10_DP.PAUSE if command is GotoActionCommand.PAUSE else B01_Q10_DP.STOP
         try:
-            async with asyncio.timeout(_GOTO_TIMEOUT):
-                while True:
-                    trace_sequence = self._map.trace_sequence
-                    if owned_trace_sequence is None:
-                        if trace_sequence is not None and trace_sequence != previous_trace_sequence:
-                            owned_trace_sequence = trace_sequence
-                            self._goto_trace_sequence = trace_sequence
-                    elif trace_sequence != owned_trace_sequence:
-                        _LOGGER.debug("Q10 goto task was replaced by another cleaning session")
-                        return
+            await self._command.send(command=dp_command, params=0)
+        except RoborockException as err:
+            if command is GotoActionCommand.PAUSE:
+                _LOGGER.warning("Failed to pause completed Q10 goto task; retrying: %s", err)
+                await asyncio.sleep(_GOTO_RETRY_INTERVAL)
+                if action is self._goto_action:
+                    self._goto_command_task = None
+                    action.retry()
+                return
+            _LOGGER.warning("Failed to stop timed-out Q10 goto task: %s", err)
+        if action is self._goto_action:
+            action.complete()
+            self.cancel_goto()
+        if self._goto_command_task is current_task:
+            self._goto_command_task = None
 
-                    if (
-                        owned_trace_sequence is not None
-                        and self._status.clean_task_type is YXDeviceCleanTask.DIVIDE_AREAS
-                        and self._status.status
-                        not in {
-                            YXDeviceState.IDLE,
-                            YXDeviceState.PAUSED,
-                            YXDeviceState.RETURNING_HOME,
-                            YXDeviceState.CHARGING,
-                        }
-                    ):
-                        owned_task_seen = True
-
-                    if owned_task_seen and self._status.clean_task_type is not YXDeviceCleanTask.DIVIDE_AREAS:
-                        _LOGGER.debug("Q10 goto task was replaced by another task type")
-                        return
-
-                    if owned_task_seen and self._status.status in {
-                        YXDeviceState.IDLE,
-                        YXDeviceState.PAUSED,
-                        YXDeviceState.RETURNING_HOME,
-                        YXDeviceState.CHARGING,
-                    }:
-                        return
-
-                    if (
-                        owned_trace_sequence is not None
-                        and (position := self._map.roborock_position) is not None
-                        and hypot(position.x - x, position.y - y) <= _GOTO_TOLERANCE
-                    ):
-                        try:
-                            await self._command.send(command=B01_Q10_DP.PAUSE, params=0)
-                        except RoborockException as err:
-                            _LOGGER.warning("Failed to pause completed Q10 goto task; retrying: %s", err)
-                        else:
-                            return
-
-                    update_event.clear()
-                    try:
-                        async with asyncio.timeout(_GOTO_RETRY_INTERVAL):
-                            await update_event.wait()
-                    except TimeoutError:
-                        pass
-        except TimeoutError:
-            if (
-                owned_trace_sequence is not None
-                and self._map.trace_sequence == owned_trace_sequence
-                and self._status.clean_task_type is YXDeviceCleanTask.DIVIDE_AREAS
-            ):
-                _LOGGER.warning(
-                    "Q10 vacuum did not reach goto target (%s, %s) within %s seconds; stopping zone task",
-                    x,
-                    y,
-                    _GOTO_TIMEOUT,
-                )
-                try:
-                    await self._command.send(command=B01_Q10_DP.STOP, params=0)
-                except RoborockException as err:
-                    _LOGGER.warning("Failed to stop timed-out Q10 goto task: %s", err)
-        finally:
-            remove_map_listener()
-            remove_status_listener()
-            if self._goto_monitor_task is current_task:
-                self._goto_monitor_task = None
-                self._goto_trace_sequence = None
+    async def _async_timeout_goto(self, action: GotoAction) -> None:
+        """Tell the active goto action when its safety timeout expires."""
+        try:
+            await asyncio.sleep(_GOTO_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        if action is self._goto_action:
+            action.timeout(self._goto_snapshot())
 
     async def start_clean(self) -> None:
         """Start a whole-home clean.
@@ -231,15 +169,13 @@ class VacuumTrait:
 
     async def clean_zone(
         self,
-        x1: int,
-        y1: int,
-        x2: int,
-        y2: int,
+        first_corner: Q10RoborockPoint,
+        second_corner: Q10RoborockPoint,
         *,
         clean_count: int = 1,
     ) -> None:
         """Clean one rectangular zone in the common Roborock coordinate space."""
-        encoded_zone = _encode_zone(x1, y1, x2, y2, clean_count)
+        encoded_zone = encode_clean_params(CleanParams(first_corner, second_corner, clean_count))
         await self._command.send(
             command=B01_Q10_DP.START_CLEAN,
             params={
@@ -250,28 +186,29 @@ class VacuumTrait:
         )
         self.cancel_goto()
 
-    async def goto_position(self, x: int, y: int) -> None:
+    async def goto_position(self, target: Q10RoborockPoint) -> None:
         """Move to a coordinate using an owned 40 cm zone-clean task."""
-        if (position := self._map.roborock_position) is not None and hypot(
-            position.x - x, position.y - y
+        target.to_vector()
+        snapshot = self._goto_snapshot()
+        if (position := snapshot.position) is not None and hypot(
+            position.x - target.x, position.y - target.y
         ) <= _GOTO_TOLERANCE:
-            if (
-                self._goto_monitor_task is not None
-                and self._goto_trace_sequence is not None
-                and self._map.trace_sequence == self._goto_trace_sequence
-                and self._status.clean_task_type is YXDeviceCleanTask.DIVIDE_AREAS
-            ):
+            if self._goto_action is not None and self._goto_action.owns(snapshot):
                 await self._command.send(command=B01_Q10_DP.PAUSE, params=0)
                 self.cancel_goto()
             return
 
-        previous_trace_sequence = self._map.trace_sequence
-        encoded_zone = _encode_zone(
-            x - _GOTO_HALF_ZONE_SIZE,
-            y - _GOTO_HALF_ZONE_SIZE,
-            x + _GOTO_HALF_ZONE_SIZE,
-            y + _GOTO_HALF_ZONE_SIZE,
-            1,
+        encoded_zone = encode_clean_params(
+            CleanParams(
+                Q10RoborockPoint(
+                    target.x - _GOTO_HALF_ZONE_SIZE,
+                    target.y - _GOTO_HALF_ZONE_SIZE,
+                ),
+                Q10RoborockPoint(
+                    target.x + _GOTO_HALF_ZONE_SIZE,
+                    target.y + _GOTO_HALF_ZONE_SIZE,
+                ),
+            )
         )
         await self._command.send(
             command=B01_Q10_DP.START_CLEAN,
@@ -281,10 +218,20 @@ class VacuumTrait:
             },
         )
         self.cancel_goto()
-        self._goto_monitor_task = asyncio.create_task(
-            self._async_monitor_goto_target(x, y, previous_trace_sequence),
-            name="roborock_q10_goto",
+        action = GotoAction(
+            target,
+            snapshot.trace_sequence,
+            tolerance=_GOTO_TOLERANCE,
         )
+        self._goto_action = action
+        self._goto_action_remove_listener = action.add_update_listener(
+            lambda command: self._goto_action_updated(action, command)
+        )
+        self._goto_timeout_task = asyncio.create_task(
+            self._async_timeout_goto(action),
+            name="roborock_q10_goto_timeout",
+        )
+        action.update(self._goto_snapshot())
 
     async def spot_clean(self) -> None:
         """Start a spot / part clean around the robot's current position.

@@ -19,6 +19,7 @@ from typing import Any
 
 from roborock.data import RoborockBase
 from roborock.data.b01_q10.b01_q10_code_mappings import B01_Q10_DP, YXDeviceState
+from roborock.data.b01_q10.b01_q10_containers import Q10RoborockPoint
 from roborock.devices.traits.common import DpsDataConverter, TraitUpdateListener
 from roborock.exceptions import RoborockException
 from roborock.map.b01_q10_map_parser import (
@@ -33,7 +34,6 @@ from roborock.map.b01_q10_render import Q10MapOverlays, render_q10_map
 
 from .command import CommandTrait
 from .common import UpdatableTrait
-from .coordinates import trace_to_roborock_coordinate
 from .maps import MapsTrait
 
 _LOGGER = logging.getLogger(__name__)
@@ -128,23 +128,15 @@ class MapContentTrait(TraitUpdateListener):
 
     @property
     def path(self) -> list[Q10Point]:
-        """Full path for live status and callers drawing their own map overlay."""
+        """Full path in the Q10 trace coordinate space used by the map renderer."""
         return self._trace_packet.points if self._trace_packet else []
 
     @property
-    def robot_position(self) -> Q10Point | None:
-        """Current position for live status and caller-rendered map overlays."""
-        return self._trace_packet.robot_position if self._trace_packet else None
-
-    @property
-    def roborock_position(self) -> Q10Point | None:
+    def robot_position(self) -> Q10RoborockPoint | None:
         """Current position in the common Roborock millimetre coordinate space."""
-        if (position := self.robot_position) is None:
+        if self._trace_packet is None or (position := self._trace_packet.robot_position) is None:
             return None
-        return Q10Point(
-            x=trace_to_roborock_coordinate(position.x),
-            y=trace_to_roborock_coordinate(position.y),
-        )
+        return position.to_roborock()
 
     @property
     def trace_sequence(self) -> int | None:
@@ -197,7 +189,9 @@ class MapContentTrait(TraitUpdateListener):
         data = {
             "rooms": [room.as_dict() for room in self.rooms],
             "path": [point.as_dict() for point in self.path],
-            "robotPosition": self.robot_position.as_dict() if self.robot_position is not None else None,
+            "robotPosition": (
+                {"x": position.x, "y": position.y} if (position := self.robot_position) is not None else None
+            ),
             "robotHeading": self.robot_heading,
         }
         for key in exclude_set:
